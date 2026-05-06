@@ -16,4 +16,8 @@ RUN npm install --omit=dev
 
 COPY wa_sender_bot.js ./
 
+# Carpeta de sesión como volumen persistente (configúrala en Railway)
+RUN mkdir -p /app/wa_session
+VOLUME ["/app/wa_session"]
+
 CMD ["node", "wa_sender_bot.js"]

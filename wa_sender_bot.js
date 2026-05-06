@@ -3,7 +3,7 @@
  * Controlado por Telegram · Powered by Baileys
  */
 
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } = require('@whiskeysockets/baileys');
 const TelegramBot = require('node-telegram-bot-api');
 const QRCode      = require('qrcode');
 const pino        = require('pino');
@@ -13,8 +13,8 @@ const fs          = require('fs');
 const path        = require('path');
 
 // ─── CONFIGURACIÓN ───────────────────────────────────────────────────────────
-const TELEGRAM_TOKEN     = '8718387604:AAG6ICLoEKoV96G4zCTMq_9cA0lKKmWrcvs';
-const AUTHORIZED_USER    = 'K11000K';
+const TELEGRAM_TOKEN     = process.env.TELEGRAM_TOKEN     || '8718387604:AAG6ICLoEKoV96G4zCTMq_9cA0lKKmWrcvs';
+const AUTHORIZED_USER    = process.env.AUTHORIZED_USER    || 'K11000K';
 const MESSAGES_PER_CYCLE = 1500;
 const CYCLE_HOURS        = 2;
 const BATCH_SIZE         = 8;
@@ -25,15 +25,17 @@ const BATCH_DELAY_MAX    = 10000;
 const SESSION_DIR        = './wa_session';
 // ─────────────────────────────────────────────────────────────────────────────
 
-let waSocket     = null;
-let waConnected  = false;
-let contactList  = [];
-let messageText  = '';
-let isSending    = false;
-let cycleTimer   = null;
-let sentTotal    = 0;
-let currentIndex = 0;
-let reconnectCount = 0;
+let waSocket        = null;
+let waConnected     = false;
+let contactList     = [];
+let messageText     = '';
+let isSending       = false;
+let cycleTimer      = null;
+let sentTotal       = 0;
+let currentIndex    = 0;
+let reconnectCount  = 0;
+let isConnecting    = false;   // evita llamadas simultáneas a connectWhatsApp
+let qrShown         = false;   // para no spam de QR
 
 // Esperando input del usuario
 let awaitingMessage  = false;
@@ -72,6 +74,16 @@ function clearSession() {
   } catch (e) {
     console.error('Error borrando sesión:', e.message);
   }
+}
+
+// Cierra el socket actual limpiamente
+function closeSocket() {
+  if (waSocket) {
+    try { waSocket.ev.removeAllListeners(); } catch {}
+    try { waSocket.end(); }                   catch {}
+    waSocket = null;
+  }
+  waConnected = false;
 }
 
 // ─── MENÚ PRINCIPAL (botones) ─────────────────────────────────────────────────
@@ -118,7 +130,7 @@ async function sendQR(chatId, qr) {
   try {
     const buf = await QRCode.toBuffer(qr, { scale: 8 });
     await bot.sendPhoto(chatId, buf, {
-      caption: '📱 *Escanea este QR con WhatsApp*\nAbre WhatsApp → Dispositivos vinculados → Vincular dispositivo',
+      caption: '📱 *Escanea este QR con WhatsApp*\nAbre WhatsApp → Dispositivos vinculados → Vincular dispositivo\n\n⚠️ _Tienes ~20 segundos antes de que expire_',
       parse_mode: 'Markdown'
     });
     console.log('QR enviado como imagen');
@@ -143,59 +155,105 @@ async function sendQR(chatId, qr) {
 
 // ─── WHATSAPP ─────────────────────────────────────────────────────────────────
 async function connectWhatsApp(chatId) {
-  const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+  // Evitar conexiones simultáneas
+  if (isConnecting) {
+    safeSend(chatId, '⏳ Ya hay una conexión en curso, espera un momento...');
+    return;
+  }
 
-  waSocket = makeWASocket({
-    auth:              state,
-    logger:            pino({ level: 'silent' }),
-    printQRInTerminal: true,   // también en logs de Railway por si acaso
-    browser:           ['Chrome (Linux)', '', ''],
-  });
+  isConnecting = true;
+  qrShown      = false;
+  closeSocket();
 
-  waSocket.ev.on('connection.update', async update => {
-    const { connection, lastDisconnect, qr } = update;
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
 
-    if (qr) {
-      reconnectCount = 0; // resetear contador si aparece el QR
-      await sendQR(chatId, qr);
-    }
+    waSocket = makeWASocket({
+      auth:              state,
+      logger:            pino({ level: 'silent' }),
+      printQRInTerminal: true,
+      browser:           Browsers.ubuntu('Chrome'),
+      connectTimeoutMs:  60_000,
+      defaultQueryTimeoutMs: 60_000,
+    });
 
-    if (connection === 'open') {
-      waConnected    = true;
-      reconnectCount = 0;
-      safeSend(chatId, '✅ *WhatsApp conectado!*', { parse_mode: 'Markdown' });
-      mainMenu(chatId);
-    }
+    waSocket.ev.on('connection.update', async update => {
+      const { connection, lastDisconnect, qr } = update;
 
-    if (connection === 'close') {
-      waConnected = false;
-      const code      = lastDisconnect?.error?.output?.statusCode;
-      const isLoggedOut = code === DisconnectReason.loggedOut;
+      // ── QR recibido ──────────────────────────────────────────────────────
+      if (qr) {
+        reconnectCount = 0;
+        qrShown        = true;
+        isConnecting   = false;
+        console.log('QR generado, enviando a Telegram...');
+        await sendQR(chatId, qr);
+      }
 
-      if (isLoggedOut) {
-        // Sesión cerrada por WhatsApp → borrar y pedir QR nuevo
-        safeSend(chatId, '❌ Sesión cerrada por WhatsApp. Borrando sesión y pidiendo QR nuevo...');
-        clearSession();
-        setTimeout(() => connectWhatsApp(chatId), 3000);
-      } else {
+      // ── Conexión abierta ─────────────────────────────────────────────────
+      if (connection === 'open') {
+        waConnected    = true;
+        reconnectCount = 0;
+        isConnecting   = false;
+        qrShown        = false;
+        safeSend(chatId, '✅ *WhatsApp conectado!*', { parse_mode: 'Markdown' });
+        mainMenu(chatId);
+      }
+
+      // ── Conexión cerrada ─────────────────────────────────────────────────
+      if (connection === 'close') {
+        waConnected  = false;
+        isConnecting = false;
+
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const message    = lastDisconnect?.error?.message || '';
+        console.log(`Conexión cerrada. Código: ${statusCode}, Mensaje: ${message}`);
+
+        // Errores que significan "sesión inválida → necesita nuevo QR"
+        const needsNewQR = (
+          statusCode === DisconnectReason.loggedOut       ||   // 401 - cerró sesión
+          statusCode === DisconnectReason.badSession      ||   // 500 - sesión corrupta
+          statusCode === 403                              ||   // forbidden
+          statusCode === 515                              ||   // stream error (sesión rota)
+          statusCode === 440                              ||   // connectionReplaced
+          message.includes('bad session')                ||
+          message.includes('QR refs attempts')           ||
+          message.includes('invalid')
+        );
+
+        if (needsNewQR) {
+          console.log('Sesión inválida detectada, borrando y pidiendo QR nuevo...');
+          safeSend(chatId, '🔄 Sesión inválida. Borrando y generando QR nuevo...');
+          clearSession();
+          await sleep(2000);
+          connectWhatsApp(chatId);
+          return;
+        }
+
+        // Errores transitorios de red → reintentar sin borrar sesión
         reconnectCount++;
         if (reconnectCount >= 5) {
-          // Demasiados intentos: probablemente sesión corrupta
+          // Demasiados fallos de red → posible sesión corrupta, borrar y pedir QR
           reconnectCount = 0;
-          safeSend(chatId,
-            '⚠️ *Muchos intentos fallidos.* Puede que la sesión esté corrupta.\n\nPulsa *🗑️ Borrar sesión* y luego *📱 Conectar WhatsApp* para escanear QR nuevo.',
-            { parse_mode: 'Markdown' }
-          );
-          mainMenu(chatId);
+          console.log('Demasiados reintentos, borrando sesión y pidiendo QR nuevo...');
+          safeSend(chatId, '⚠️ Demasiados fallos de red. Borrando sesión y generando QR nuevo...');
+          clearSession();
+          await sleep(3000);
+          connectWhatsApp(chatId);
         } else {
           safeSend(chatId, `🔄 Reconectando... (intento ${reconnectCount}/5)`);
-          setTimeout(() => connectWhatsApp(chatId), 5000);
+          await sleep(5000 * reconnectCount); // backoff progresivo
+          connectWhatsApp(chatId);
         }
       }
-    }
-  });
+    });
 
-  waSocket.ev.on('creds.update', saveCreds);
+    waSocket.ev.on('creds.update', saveCreds);
+
+  } catch (err) {
+    isConnecting = false;
+    console.error('Error en connectWhatsApp:', err.message);
+    safeSend(chatId, `❌ Error al conectar: ${err.message}\n\nIntenta *🗑️ Borrar sesión* y vuelve a conectar.`, { parse_mode: 'Markdown' });
+  }
 }
 
 // ─── ENVÍO ────────────────────────────────────────────────────────────────────
@@ -266,12 +324,9 @@ bot.on('callback_query', async query => {
       break;
 
     case 'borrar_sesion':
-      if (waSocket) {
-        try { waSocket.end(); } catch {}
-        waSocket = null;
-      }
-      waConnected = false;
+      closeSocket();
       reconnectCount = 0;
+      isConnecting   = false;
       clearSession();
       safeSend(chatId, '🗑️ Sesión borrada. Ahora pulsa *📱 Conectar WhatsApp* para escanear el QR.', { parse_mode: 'Markdown' });
       mainMenu(chatId);
@@ -330,7 +385,7 @@ bot.on('callback_query', async query => {
       mainMenu(chatId);
       break;
 
-    case 'estado':
+    case 'estado': {
       const preview = messageText
         ? `"${messageText.substring(0, 60)}${messageText.length > 60 ? '...' : ''}"`
         : '❌ Sin configurar';
@@ -350,6 +405,7 @@ bot.on('callback_query', async query => {
         }
       );
       break;
+    }
 
     case 'reset':
       currentIndex = 0;
